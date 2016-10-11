@@ -1,0 +1,150 @@
+#!/usr/bin/env python
+
+import argparse
+import logging
+import os
+import signal
+import sys
+import subprocess
+import time
+import yaml
+
+LOG_LEVEL = logging.DEBUG if os.getenv('DEBUG', None) else logging.INFO
+TIME_FORMAT = 'YYYY-mm-dd HH:MM:SS'
+
+parser = argparse.ArgumentParser(description='Run a point in time restore for Postgres.')
+parser.add_argument('--source', metavar='SourceDir', type=str, required=True, help='source directory of the Postgres.')
+parser.add_argument('--wal', metavar='WalDir', type=str, required=True, help='wal archive directory.')
+parser.add_argument('--destination', metavar='DestDir', type=str, required=True, help='destination directory.')
+parser.add_argument('--recovery_option', metavar='E|L|T|R|X', type=str, choices=['E','L','T','R','X'], default='L', help='recovery type [(E)arliest, (L)atest, (T)ime, (R)estore point, (X)id]')
+parser.add_argument('--post_action', metavar='pause|promote|shutdown', choices=['pause','promote','shutdown'], default='shutdown', help='post recovery action [pause|promote|shutdown(default)]')
+option_group = parser.add_mutually_exclusive_group(required=False)
+option_group.add_argument('--recovery_time', metavar='\"%s\"' % TIME_FORMAT, type=str, help='time to restore to (%s)' % TIME_FORMAT)
+option_group.add_argument('--recovery_point', metavar='RestorePoint', type=str,help='name of the restore point to be used.')
+option_group.add_argument('--recovery_xid', metavar='Xid', type=str, help='xid to restore to.')
+command_line_args = parser.parse_args()
+
+if ( LOG_LEVEL == logging.DEBUG ):
+    print('source=%s' % command_line_args.source)
+    print('wal=%s' % command_line_args.wal)
+    print('destination=%s' % command_line_args.destination)
+    print('recovery_option=%s' % command_line_args.recovery_option)
+    print('post_action=%s' % command_line_args.post_action)
+    print('recovery_time=%s' % command_line_args.recovery_time)
+    print('restore_point=%s' % command_line_args.recovery_point)
+    print('recovery_xid=%s' % command_line_args.recovery_xid)
+
+option = command_line_args.recovery_option
+action = command_line_args.post_action
+source_data_directory = command_line_args.source
+dest_data_directory = command_line_args.destination
+wal_archive = command_line_args.wal
+
+config = yaml.load(open('config.yml', 'r').read())
+
+# Extract the Postgres version
+try:
+    database_version = open('%s/PG_VERSION' % source_data_directory, 'r').read().strip()
+except IOError:
+    logging.fatal('Error opening data directory %s' % source_data_directory)
+    sys.exit(1)
+
+# Ensure we have the proper version of Postgres
+bin_path = config['versions'][database_version]
+
+# Format the destination time properly
+if ( option == 'T' ):
+    time_ok=False
+    while ( time_ok == False ):
+        dest_time = command_line_args.recovery_time or raw_input('Restore time UTC (%s): ' % TIME_FORMAT)
+        try:
+            dest_time = time.strptime(dest_time, '%Y-%m-%d %H:%M:%S')
+        except:
+            print('Invalid date: %(time)s - should be in the format %(format)s\n' % {'time' : dest_time, 'format' : TIME_FORMAT})
+            continue
+        time_ok=True
+
+if ( option == 'R' ):
+    restore_point = command_line_args.recovery_point or raw_input('Name of restore point to use: ')
+
+if ( option == 'X' ):
+    dest_xid = command_line_args.recovery_xid or raw_input('Xid to restore to: ')
+
+# Build the destination directory
+try:
+    os.makedirs(dest_data_directory, 0700 )
+except OSError:
+    print('Error in creating directory %s - check that you have permissions on the parent directory and that the specified directory does not already exist\n' % dest_data_directory)
+    sys.exit(1)
+
+# Copy the source directory
+print('Copying database backup from %(source)s to %(dest)s\n' % {'source': source_data_directory, 'dest': dest_data_directory});
+if subprocess.call('cp -a %(source)s/* %(dest)s/' % {'source': source_data_directory, 'dest': dest_data_directory}, shell=True) != 0:
+    logging.fatal('Error copying source to destination to begin the restore process.')
+    sys.exit(1)
+
+# Modify postgresql.conf to not overwrite the source wal files
+template = """
+max_connections = 100
+shared_buffers = 128MB
+dynamic_shared_memory_type = posix
+wal_level = hot_standby
+# archive_mode = on
+# archive_command = 'mv %p ../wal_archive/$f'
+# max_wal_senders = 1
+log_timezone = 'US/Central'
+datestyle = 'iso, mdy'
+timezone = 'US/Central'
+lc_messages = 'en_US.UTF-8'
+lc_monetary = 'en_US.UTF-8'
+lc_numeric = 'en_US.UTF-8'
+lc_time = 'en_US.UTF-8'
+default_text_search_config = 'pg_catalog.english'
+"""
+postgresql_conf = open("%s/postgresql.conf" % dest_data_directory, "w")
+postgresql_conf.write(template)
+postgresql_conf.close()
+
+template = """
+# -------------------------------
+# PostgreSQL recovery config file
+# -------------------------------
+"""
+
+# Build the recovery.conf file
+recovery_conf = open("%s/recovery.conf" % dest_data_directory, "w")
+recovery_conf.write(template)
+recovery_conf.write('restore_command=\'cp ../%s/$f %%p 2>/dev/null\'\n' % wal_archive)
+if ( database_version >= 9.5 ):
+    recovery_conf.write('recovery_target_action=%s\n' % action)
+if ( option == 'T' ):
+    recovery_conf.write('recovery_target_time=\'%s\'\n' % time.strftime('%Y-%m-%d %H:%M:%S CDT', dest_time))
+if ( option == 'R' ):
+    recovery_conf.write('recovery_target_name=\'%s\'\n' % restore_point)
+if ( option == 'X' ):
+    recovery_conf.write('recovery_target_xid=\'%s\'\n' % dest_xid)
+if ( option == 'E' ):
+    recovery_conf.write('recovery_target=\'immediate\'\n')
+recovery_conf.close()
+
+    
+# start postgresql
+os_command ='%(bin)s/bin/pg_ctl start -D %(dest)s -l %(dest)s.log' % {'bin': bin_path, 'dest': dest_data_directory}
+print('Starting postgres for %(dest)s\n' % {'dest': dest_data_directory});
+if ( LOG_LEVEL == logging.DEBUG ):
+	print('Running command: %s\n' % os_command)
+
+if subprocess.call(os_command, shell=True) != 0:
+    logging.fatal("Error running Postgres")
+    sys.exit(1)
+
+# For versions below 9.5 have to implement the postgresql shutdown manually
+if ( database_version < 9.5 and ( action == 'shutdown' or action == 'pause' ) ):
+    os_command ='sleep 10;%(bin)s/bin/pg_ctl stop -D %(dest)s' % {'bin': bin_path, 'dest': dest_data_directory}
+    print('Stopping postgres for %(dest)s\n' % {'dest': dest_data_directory});
+    if subprocess.call(os_command, shell=True) != 0:
+        logging.fatal("Error stopping Postgres")
+        sys.exit(1)
+
+sys.exit(0)
+
